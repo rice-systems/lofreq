@@ -299,7 +299,7 @@ def bins_from_bamheader(bam):
     return [(x[0], 0, x[1]) for x in sq_list]
 
 
-def lofreq_cmd_per_bin(lofreq_call_args, bins, tmp_dir):
+def lofreq_cmd_per_bin(lofreq_call_args, bins, tmp_dir, use_fpga=False):
     """Returns argument for one lofreq call per bins (Regions()).
     Order is by length byt file naming is according to input order
     """
@@ -315,7 +315,18 @@ def lofreq_cmd_per_bin(lofreq_call_args, bins, tmp_dir):
         LOG.debug("length sorted bin keeping input index #%d: %s" % (i, b))
         # maintain region order by using index
         reg_str = "%s:%d-%d" % (b.chrom, b.start+1, b.end)
-        cmd = ' '.join(lofreq_call_args)
+
+        if use_fpga:
+            # using the FPGA version, passing the bin number to lofreq call
+            arg_pos=2   # inserting bin number arguments right after 'lofreq', 'call'
+            lofreq_call_args_local = lofreq_call_args[:-1]
+            lofreq_call_args_local.insert(arg_pos, "-p")
+            lofreq_call_args_local.insert(arg_pos+1, str(i))
+            cmd = ' '.join(lofreq_call_args_local)
+        else:
+            # using the original CPU version
+            cmd = ' '.join(lofreq_call_args)
+
         cmd += ' --no-default-filter'# needed here whether user-arg or not
         cmd += ' -r "%s" -o %s/%d.vcf.gz > %s/%d.log 2>&1' % (
             reg_str, tmp_dir, i, tmp_dir, i)
@@ -518,6 +529,11 @@ def main():
     if '--no-default-filter' in lofreq_call_args:
         no_default_filter = True
 
+    # determine whether the FPGA or CPU version is used
+    # 
+    use_fpga = False
+    if '--fpga' in lofreq_call_args:
+        use_fpga = True
 
     # prepend actual lofreq command
     #
@@ -637,7 +653,7 @@ def main():
             i, b.chrom, b.start, b.end, region_length(b)))
 
     #bins = [Region('chr22', 0, 50000000)]# TMPDEBUG
-    cmd_list = list(lofreq_cmd_per_bin(lofreq_call_args, bins, tmp_dir))
+    cmd_list = list(lofreq_cmd_per_bin(lofreq_call_args, bins, tmp_dir, use_fpga))
     #FIXME assert len(cmd_list) > 1, (
     #    "Oops...did get %d instead of multiple commands to run on BAM: %s" % (len(cmd_list), bam))
     LOG.info("Adding %d commands to mp-pool" % len(cmd_list))
