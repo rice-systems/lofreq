@@ -68,6 +68,10 @@ int bed_overlap(const void *_h, const char *chr, int beg, int end);
 #include "plp.h"
 #include "defaults.h"
 
+#ifdef USE_FPGA
+#include "fpga.h"
+#endif
+
 #if 1
 #define MYNAME "lofreq call"
 #else
@@ -87,6 +91,64 @@ long long int num_indel_tests = 0;
 
 long int indel_calls_wo_idaq = 0;
 
+#ifdef USE_FPGA
+
+/* Helper function to initialize OpenCL platforms and devices.
+ * Adapted from the Xilinx Vitis doc:
+ * https://docs.xilinx.com/r/2021.1-English/ug1393-vitis-application-acceleration/OpenCL-Host-Application
+ * */
+void get_xilinx_device(cl_device_id * devices, cl_uint *num_devices)
+{
+     cl_uint num_entries = MAX_DEVICE_ENTIRES;
+     cl_uint platform_count;
+
+     cl_platform_id platforms[MAX_DEVICE_ENTIRES];
+     char cl_platform_vendor[NAME_LENGTH];
+     char cl_device_name[NAME_LENGTH];
+
+     cl_int err;
+
+     // Set up the OpenCL platform.
+     err = clGetPlatformIDs(num_entries, platforms, &platform_count);
+     if (err != CL_SUCCESS) {
+          fprintf(stderr, "clGetPlatformIDs failed\n");
+          if (err != CL_INVALID_VALUE) {
+               fprintf(stderr, "clGetPlatformIDs: CL_INVALID_VALUE\n");
+          }
+          return;
+     }
+
+     // Looking for the Xilinx Platform
+     for (unsigned int iplat=0; iplat < platform_count; iplat++) {
+          err = clGetPlatformInfo(platforms[iplat],
+          CL_PLATFORM_VENDOR, PLATFORM_PARAM_SIZE,
+          cl_platform_vendor, NULL);
+
+          if (err != CL_SUCCESS) {
+               fprintf(stderr, "clGetPlatformInfo failed\n");
+               return;
+          }
+
+          if (strcmp(cl_platform_vendor, "Xilinx") == 0) {
+               fprintf(stdout, "SUCCESS: %d %s platform(s) found\n",
+                    platform_count, cl_platform_vendor);
+
+               err = clGetDeviceIDs(platforms[iplat],
+                    CL_DEVICE_TYPE_ACCELERATOR, MAX_DEVICE_ENTIRES,
+                    devices, num_devices);
+               if (err != CL_SUCCESS) {
+                    fprintf(stderr, "clGetDeviceIDs failed\n");
+                    exit(-1);
+               }
+               fprintf(stdout, "SUCCESS: Found %d device(s)\n", *num_devices);
+               return;
+          }
+     }
+     fprintf(stderr, "Failed to find Xilinx devices.\n");
+     exit(-1);
+}
+
+#endif
 
 /* variant reporter to be used for all types */
 void
@@ -1093,6 +1155,9 @@ for cov in coverage_range:
               {"sig", required_argument, NULL, 'a'},
               {"bonf", required_argument, NULL, 'b'}, /* NOTE changes here must be reflected in pseudo_parallel code as well */
 
+#ifdef USE_FPGA
+              {"in-data-chunk-id", required_argument, NULL, 'p'},
+#endif
               {"min-cov", required_argument, NULL, 'C'},
               {"max-depth", required_argument, NULL, 'd'},
               {"approx-threshold", required_argument, NULL, 't'},
@@ -1110,7 +1175,11 @@ for cov in coverage_range:
          };
 
          /* keep in sync with long_opts and usage */
+#ifdef USE_FPGA
+         static const char *long_opts_str = "r:l:f:o:q:Q:R:j:J:K:DeBAm:M:NsS:T:a:b:p:C:d:h";
+#else
          static const char *long_opts_str = "r:l:f:o:q:Q:R:j:J:K:DeBAm:M:NsS:T:a:b:C:d:h";
+#endif
          /* getopt_long stores the option index here. */
          int long_opts_index = 0;
          c = getopt_long(argc-1, argv+1, /* skipping 'lofreq', just leaving 'command', i.e. call */
@@ -1121,6 +1190,12 @@ for cov in coverage_range:
 
          switch (c) {
          /* see usage sync */
+#ifdef USE_FPGA
+         case 'p':
+            proc_bin_id = atoi(optarg); // the bin number generated in the call_parallel script
+            break;
+#endif 
+
          case 'r':
               mplp_conf.reg = strdup(optarg);
               /* FIXME you can enter lots of invalid stuff and libbam
@@ -1469,8 +1544,72 @@ for cov in coverage_range:
          plp_proc_func = &call_vars;
     }
 
+#ifdef USE_FPGA
+    printf("***************** FPGA HOST - OpenCL INIT *****************\n");
+    cl_int err = CL_SUCCESS;
+    cl_int status = CL_SUCCESS;
+    cl_uint num_devices = 0;
+
+    get_xilinx_device(&devices, &num_devices);
+    err = clGetDeviceInfo(devices, CL_DEVICE_NAME,
+         PLATFORM_PARAM_SIZE, cl_device_name, 0);
+    if (err != CL_SUCCESS) {
+         fprintf(stderr, "clGetDeviceInfo failed.\n");
+         return -1;
+    }
+    fprintf(stdout, "Device: %s\n", cl_device_name);
+
+    // context
+    err = CL_SUCCESS;
+    context = clCreateContext(0, num_devices, &devices, NULL, NULL, &err);
+
+    // Load the XCLBIN.
+    int size = ae_load_file_to_memory(xclbin, (char **) &kernelBinary);
+    if (size < 0) {
+         fprintf(stderr, "loading binary failed.\n");
+         return -1; 
+    }
+    fprintf(stdout, "SUCCESS: XCLBIN loaded\n");
+
+    // Create an OpenCL Program from the loaded XCLBIN.
+    err = CL_SUCCESS; 
+    size_t size_var = size; 
+    program = clCreateProgramWithBinary(context, num_devices,
+         &devices, &size_var,(unsigned char **) &kernelBinary, &status, &err);
+    if (status != CL_SUCCESS || err != CL_SUCCESS) {
+         fprintf(stderr, "clCreateProgramWithBinary failed.\n");
+         return -1; 
+    } 
+
+    // Set up an OpenCL Command Queue.
+    err = CL_SUCCESS;
+    cmd_queue = clCreateCommandQueue(context, devices,
+         CL_QUEUE_PROFILING_ENABLE | CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE, &err);
+    if (err != CL_SUCCESS) {
+         fprintf(stderr, "clCreateCommandQueue failed.\n");
+         return -1;
+    }
+
+    // Create an OpenCL Kernel.
+    err = CL_SUCCESS;
+    kernel1 = clCreateKernel(program, krnl_func, &err);
+    if (err != CL_SUCCESS) { 
+         fprintf(stderr, "clCreateKernel failed.\n");
+         return -1;
+    }
+    printf("***************** FPGA HOST - OpenCL INIT *****************\n");
+#endif
     rc = mpileup(&mplp_conf, plp_proc_func, (void*)&varcall_conf,
                  1, (const char **) argv + optind + 1);
+#ifdef USE_FPGA
+    // Releasing OpenCL objects
+    clReleaseCommandQueue(cmd_queue);
+    clReleaseContext(context);
+    clReleaseDevice(devices);
+    clReleaseKernel(kernel1);
+    clReleaseProgram(program);
+#endif
+
     if (rc) {
          free(vcf_tmp_out);
          return rc;
