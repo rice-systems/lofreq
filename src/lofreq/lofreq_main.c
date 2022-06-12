@@ -53,6 +53,37 @@
 __DATE__ = "NA";
 #endif
 
+#ifdef USE_FPGA
+
+#include "fpga.h"
+
+char cl_device_name[NAME_LENGTH];  // The OpenCL device name
+
+// OpenCL objects
+cl_device_id devices;
+cl_context context;
+cl_program program;
+cl_command_queue cmd_queue;
+cl_kernel kernel1;
+cl_mem in_buf, out_buf;
+double * in_buf_host;
+double * out_buf_host;
+unsigned char *kernelBinary;
+
+// The name of the XCLBIN file
+char *xclbin = "krnl.xclbin";
+
+// The name of the kernel function
+char *krnl_func = "krnl";
+
+// Input data chunk (bin) id: the id of the data chunk 
+// generated in the lofreq2_call_pparallel.py script.
+// This is needed when using an FPGA design with
+// more than 15 CUs, in the lofreq call-parallel mode.
+int proc_bin_id; 
+
+#endif
+
 static void prepend_dir_to_path(const char *dir_to_add)
 {
      char *old_path = NULL;
@@ -278,7 +309,12 @@ int main(int argc, char *argv[])
           for (i=2; i<argc; i++) {
                argv_execvp[i-1] = argv[i];
           }
+#ifdef USE_FPGA
+          argv_execvp[i-1] = "--fpga";
+          argv_execvp[i] = NULL;
+#else
           argv_execvp[i-1] = NULL; /* sentinel */
+#endif
           if (execvp(script_to_call, argv_execvp)) {
                perror("Calling external LoFreq script via execvp failed");
                free(argv_execvp);
