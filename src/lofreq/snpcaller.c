@@ -47,10 +47,21 @@
 #include "gsl/gsl_cdf.h"
 
 #include "snpcaller.h"
+
+#ifdef USE_FPGA
+#include "fpga.h"
+#endif
+
+#ifdef USE_FPGA
+#if TIMING || PROFILING
+#include <time.h>
+#endif
+#else
 #if TIMING
 #include <time.h>
 #endif
 
+#endif
 
 /* Converting MQ=0 into prob would 'kill' a read. Previously used 0.66 here since
    the median number of best hits in BWA for one examined human wgs sample
@@ -1026,8 +1037,77 @@ poissbin(long double *pvalue, const double *err_probs,
     probvec = naive_prob_dist(err_probs, num_err_probs,
                                     num_failures);
 #else
+
+#ifdef USE_FPGA
+    int use_cpu = 0;
+    if (MAX_BUFFER_SIZE < num_failures)
+          use_cpu = 1;
+
+    if (1 == use_cpu) { 
+        // Using the cpu instead the device 
+        probvec = pruned_calc_prob_dist(err_probs, num_err_probs,
+                num_failures, bonf, sig);
+
+        fprintf(stderr, "CPU: N: %d, K: %d\n", num_err_probs, num_failures);
+        return probvec; 
+    } else { 
+
+#if PROFILING
+        struct timespec kernel_s, kernel_t;
+        clock_gettime(CLOCK_REALTIME, &kernel_s);
+#endif
+        cl_event host_2_device;
+        cl_event exec_event;
+        cl_event device_2_host;
+        cl_mem mems[1] = {in_buf};
+        cl_int err = CL_SUCCESS;
+
+        err = clEnqueueMigrateMemObjects(cmd_queue, 1, mems, 0, 0, NULL,
+          &host_2_device);
+        if (err != CL_SUCCESS) {
+            fprintf(stderr, "clEnqueueMigrateMemObjects failed.\n");
+        }
+
+        err = CL_SUCCESS;
+        err = clEnqueueTask(cmd_queue, kernel1, 1, &host_2_device, &exec_event);
+        if(err != CL_SUCCESS) {
+            fprintf(stderr, "clEnqueueTask failed.\n");
+        }
+
+        err = CL_SUCCESS;
+        err = clEnqueueMigrateMemObjects(cmd_queue, 1, &out_buf,
+        CL_MIGRATE_MEM_OBJECT_HOST, 1, &exec_event, &device_2_host);
+        if (err != CL_SUCCESS) {
+            fprintf(stderr, "clEnqueueMigrateMemObjects failed.\n");
+        }
+
+        // Synchronization point: wait until the results are ready.
+        clWaitForEvents(1, &device_2_host);
+        clReleaseEvent(host_2_device);
+        clReleaseEvent(exec_event);
+        clReleaseEvent(device_2_host);
+
+#if PROFILING
+        clock_gettime(CLOCK_REALTIME, &kernel_t);
+
+        long seconds = kernel_t.tv_sec - kernel_s.tv_sec;
+        long nanoseconds = kernel_t.tv_nsec - kernel_s.tv_nsec;
+        double elapsed = seconds + nanoseconds*1e-9;
+        printf("krnl: %g, N: %d, K: %d\n", elapsed, num_err_probs, num_failures);
+#endif
+
+        probvec = malloc((num_failures + 1) * sizeof(double));
+
+        for (int j = 0; j < (num_failures + 1); j++) {
+            probvec[j] = out_buf_host[j];
+        }
+     }
+#else
+    // Executing the CPU version as if the FPGA components doesn't exist.
     probvec = pruned_calc_prob_dist(err_probs, num_err_probs,
                                     num_failures, bonf, sig);
+#endif
+
 #endif
 #if TIMING
     msec = (clock() - start) * 1000 / CLOCKS_PER_SEC;
@@ -1131,8 +1211,88 @@ snpcaller(long double *snp_pvalues,
      #endif
 #endif
 
+#ifdef USE_FPGA
+    /* Initializing OpenCL objects */
+    // Setting up DDR bank(s)
+    cl_int err = CL_SUCCESS;
+    cl_mem_ext_ptr_t in_buffer_ext = {0};
+    cl_mem_ext_ptr_t out_buffer_ext = {0};
+
+    // By default, each column unit connects to DDR bank 1.
+    int bank_id = 1;
+    in_buffer_ext.obj = 0;
+    out_buffer_ext.obj = 0;
+    in_buffer_ext.param = 0;
+    out_buffer_ext.param = 0;
+    in_buffer_ext.banks = bank_id | XCL_MEM_TOPOLOGY;
+    out_buffer_ext.banks = bank_id | XCL_MEM_TOPOLOGY;
+    in_buffer_ext.flags = bank_id | XCL_MEM_TOPOLOGY;
+    out_buffer_ext.flags = bank_id | XCL_MEM_TOPOLOGY;
+
+#if USE_MANY_COMPUTE_UNITS
+    // Each memory port can connect at most 15 CUs.
+    // If the design contains more than 15 CUs, some need to connect to DDR
+    // bank 3 instead of 1.
+    // The assignment is done based on the data chunk (bin) id of the process.
+    if (proc_bin_id % 2 == 0) {
+        bank_id = 3;
+        in_buffer_ext.banks = bank_id | XCL_MEM_TOPOLOGY;
+        out_buffer_ext.banks = bank_id | XCL_MEM_TOPOLOGY;
+        in_buffer_ext.flags = bank_id | XCL_MEM_TOPOLOGY;
+        out_buffer_ext.flags = bank_id | XCL_MEM_TOPOLOGY;
+    }
+#endif
+
+    int N_size = num_err_probs;
+    int K_plus1_size = max_noncons_count + 1;
+
+    in_buf = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_EXT_PTR_XILINX,
+     sizeof(double) * N_size, &in_buffer_ext, &err);
+    out_buf = clCreateBuffer(context, CL_MEM_WRITE_ONLY | CL_MEM_EXT_PTR_XILINX,
+     sizeof(double) * K_plus1_size, &out_buffer_ext, &err);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "clCreateBuffer failed.\n");
+    }
+
+    // Setting up the arguments of the kernel function
+    err = CL_SUCCESS;
+    err |= clSetKernelArg(kernel1, 0, sizeof(in_buf), &in_buf);
+    err |= clSetKernelArg(kernel1, 1, sizeof(int), &num_err_probs); // N
+    err |= clSetKernelArg(kernel1, 2, sizeof(int), &max_noncons_count); // K
+    err |= clSetKernelArg(kernel1, 3, sizeof(out_buf), &out_buf);
+
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "clSetKernelArg failed.\n");
+        return -1;
+    }
+
+    // Setting up the pointer to the input and output buffer
+    err = CL_SUCCESS;
+    in_buf_host = (double*) clEnqueueMapBuffer(cmd_queue, in_buf,
+     CL_TRUE, CL_MAP_WRITE, 0, sizeof(double) * N_size, 0, NULL, NULL, &err);
+    out_buf_host = (double*) clEnqueueMapBuffer(cmd_queue, out_buf,
+     CL_TRUE, CL_MAP_READ, 0, sizeof(double) * K_plus1_size, 0, NULL, NULL, &err);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "clEnqueueMapBuffer failed.\n");
+        return -1;
+    }
+
+    // Filling the input buffer with actual input (error probabilities)
+    for (int k = 0; k < N_size; k++) {
+        in_buf_host[k] = err_probs[k];
+    }
+
+    /* Initializing OpenCL objects ends */
+#endif
+
     probvec = poissbin(&pvalue, err_probs, num_err_probs,
                        max_noncons_count, bonf_factor, sig_level);
+
+#ifdef USE_FPGA
+    // Releasing the OpenCL buffer objects
+    clReleaseMemObject(in_buf);
+    clReleaseMemObject(out_buf);
+#endif
 
 #if 0
     for (i=1; i<max_noncons_count+1; i++) {
