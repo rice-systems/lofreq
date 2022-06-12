@@ -199,6 +199,21 @@ if test "$ax_cv_htslib" != yes; then
 fi
 AM_CONDITIONAL([HTSLIB_IS_SRC], [test "$ax_cv_htslib_which" = source])
 
+# --- specify whether to use the FPGA version
+#
+AC_MSG_CHECKING([whether to build the FPGA version])
+AC_ARG_ENABLE([fpga],
+              [AS_HELP_STRING([--enable-fpga],
+                              [Specify using the FPGA version (default=no)])],
+              [use_fpga=yes],
+              [use_fpga=no])
+AC_MSG_RESULT([$use_fpga])
+path_to_xrt=${PATH_TO_XRT}
+if test x"$use_fpga" = x"yes"; then
+    CFLAGS="-DUSE_FPGA ${CFLAGS} -I$path_to_xrt/include/ -L$path_to_xrt/lib/"
+    LIBS="${LIBS}-lOpenCL -lpthread -lrt -lxrt_coreutil"
+fi
+
 AC_SUBST([AM_CFLAGS])
 AC_SUBST([AM_LDFLAGS])
 
